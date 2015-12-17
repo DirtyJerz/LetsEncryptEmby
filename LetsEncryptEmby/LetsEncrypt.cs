@@ -195,7 +195,7 @@ namespace MediaBrowser.ServerApplication.Networking
 
 
             //host file on :80 now
-            string myFolder = $"./ssl/domains/{hostname}/.well-known/acme-challenge";
+            string myFolder = $"./ssl/domains/{hostname}"; ///.well-known/acme-challenge";
             SimpleHTTPServer myServer = new SimpleHTTPServer(myFolder,80);
 
             //tell CA we've completed challenge
