@@ -21,6 +21,7 @@ namespace MediaBrowser.ServerApplication.Networking
         static string TERMS = "https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf";
         static string nextNonce;
         static string sslDir;
+
         internal static void GetCert(string sslPath, string hostname, string email)
         {
             sslDir = sslPath;
@@ -31,29 +32,29 @@ namespace MediaBrowser.ServerApplication.Networking
             downloadCertificate(hostname);
         }
 
-        public static void RenewCert(string email)
+        public static void RenewCert(string sslpath, string email)
         {
             //get certificate
             //check for existing certs
-            if (File.Exists(sslDir + "/certs/cert.pfx"))
+            if (File.Exists(sslpath + "/certs/cert.pfx"))
             {
                 //check expiration on cert.
                 Console.WriteLine("Cert found. Checking expiration date.");
-                X509Certificate origCert = X509Certificate.CreateFromCertFile(sslDir + "/certs/cert.pfx");
+                X509Certificate origCert = X509Certificate.CreateFromCertFile(sslpath + "/certs/cert.pfx");
 
                 var expiration = origCert.GetExpirationDateString();
                 if (DateTime.Parse(expiration).Subtract(DateTime.Now).Days < 30)
                 {
                     Console.WriteLine("Cert is going to expire in < 30 days....renewing.");
                     //renew and quit.
-                    AcmeHttpResponse certReq = getHttpResponse(File.ReadAllText(sslDir + "/certs/cert.uri"));
+                    AcmeHttpResponse certReq = getHttpResponse(File.ReadAllText(sslpath + "/certs/cert.uri"));
                     if (certReq.StatusCode == HttpStatusCode.OK)
                     {
                         if (certReq.ContentAsString != "")
                         {
                             X509Certificate2 newCert = new X509Certificate2();
                             newCert.Import(certReq.RawContent);
-                            StreamReader sr = new StreamReader(sslDir + "/keys/csr.key");
+                            StreamReader sr = new StreamReader(sslpath + "/keys/csr.key");
                             const String pemprivheader = "-----BEGIN RSA PRIVATE KEY-----";
                             const String pemprivfooter = "-----END RSA PRIVATE KEY-----";
                             string pemstr = sr.ReadToEnd();
@@ -64,7 +65,7 @@ namespace MediaBrowser.ServerApplication.Networking
                             String pvkstr = sb.ToString().Trim();
                             RSACryptoServiceProvider rsaAccount = DecodeRSAPrivateKey(pvkstr.Base64UrlDecode());
                             newCert.PrivateKey = rsaAccount;
-                            File.WriteAllBytes(Directory.CreateDirectory(sslDir + "/certs").FullName + "/cert.pfx", newCert.Export(X509ContentType.Pfx));
+                            File.WriteAllBytes(Directory.CreateDirectory(sslpath + "/certs").FullName + "/cert.pfx", newCert.Export(X509ContentType.Pfx));
                             Console.WriteLine("SUCCESS cert renewed");
                         }
                         else
