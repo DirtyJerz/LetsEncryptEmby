@@ -10,62 +10,75 @@ using System.Security.Cryptography.X509Certificates;
 using Newtonsoft.Json;
 using Oocx.Asn1PKCS.PKCS10;
 using Oocx.Asn1PKCS.Asn1BaseTypes;
-
+using System.Runtime.InteropServices;
 
 namespace MediaBrowser.ServerApplication.Networking
 {
     internal class LetsEncrypt
     {
-        static string CA = "https://acme-v01.api.letsencrypt.org";
+        //static string CA = "https://acme-v01.api.letsencrypt.org";
+        static string CA = "https://acme-staging.api.letsencrypt.org";
         static string TERMS = "https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf";
         static string nextNonce;
-
-        internal static void GetCert(string hostname, string email)
+        static string sslDir;
+        internal static void GetCert(string sslPath, string hostname, string email)
         {
-            Register(hostname, email);
+            sslDir = sslPath;
+            Register(email);
             AuthzObject auth = Authz(hostname, email);
-            if (auth==null) { return; }
-            completeChallenge(hostname, auth);
+            if (auth == null) { return; }
+            completeChallenge(auth);
             downloadCertificate(hostname);
         }
 
-        public static void RenewCert(string hostname, string email)
+        public static void RenewCert(string email)
         {
             //get certificate
             //check for existing certs
-            if (File.Exists($"./ssl/domains/{hostname}/certs/cert.pfx"))
+            if (File.Exists(sslDir + "/certs/cert.pfx"))
             {
                 //check expiration on cert.
                 Console.WriteLine("Cert found. Checking expiration date.");
-                X509Certificate cert = X509Certificate.CreateFromCertFile($"./ssl/domains/{hostname}/certs/cert.pfx");
+                X509Certificate origCert = X509Certificate.CreateFromCertFile(sslDir + "/certs/cert.pfx");
 
-                var expiration = cert.GetExpirationDateString();
+                var expiration = origCert.GetExpirationDateString();
                 if (DateTime.Parse(expiration).Subtract(DateTime.Now).Days < 30)
                 {
                     Console.WriteLine("Cert is going to expire in < 30 days....renewing.");
                     //renew and quit.
-                    AcmeHttpResponse certReq = getHttpResponse(File.ReadAllText($"./ssl/domains/{hostname}/certs/cert.uri"));
+                    AcmeHttpResponse certReq = getHttpResponse(File.ReadAllText(sslDir + "/certs/cert.uri"));
                     if (certReq.StatusCode == HttpStatusCode.OK)
                     {
                         if (certReq.ContentAsString != "")
                         {
-                            cert = new X509Certificate();
-                            cert.Import(certReq.RawContent);
-                            File.WriteAllBytes(Directory.CreateDirectory($"./ssl/domains/{hostname}/certs").FullName + "/cert.pfx", cert.Export(X509ContentType.Pfx));
+                            X509Certificate2 newCert = new X509Certificate2();
+                            newCert.Import(certReq.RawContent);
+                            StreamReader sr = new StreamReader(sslDir + "/keys/csr.key");
+                            const String pemprivheader = "-----BEGIN RSA PRIVATE KEY-----";
+                            const String pemprivfooter = "-----END RSA PRIVATE KEY-----";
+                            string pemstr = sr.ReadToEnd();
+                            sr.Close();
+                            StringBuilder sb = new StringBuilder(pemstr);
+                            sb.Replace(pemprivheader, "");  //remove headers/footers, if present
+                            sb.Replace(pemprivfooter, "");
+                            String pvkstr = sb.ToString().Trim();
+                            RSACryptoServiceProvider rsaAccount = DecodeRSAPrivateKey(pvkstr.Base64UrlDecode());
+                            newCert.PrivateKey = rsaAccount;
+                            File.WriteAllBytes(Directory.CreateDirectory(sslDir + "/certs").FullName + "/cert.pfx", newCert.Export(X509ContentType.Pfx));
                             Console.WriteLine("SUCCESS cert renewed");
                         }
                         else
                         {
                             Console.WriteLine("Failed to renew cert");
-                            Quit();
+                            return;
                         }
                     }
                 }
             }
-        
+
         }
-        
-        private static void Register(string hostname, string email)
+
+        private static void Register(string email)
         {
             //build account registration payload
             var newReg = new
@@ -81,11 +94,11 @@ namespace MediaBrowser.ServerApplication.Networking
 
             var message = new JWSMessage
             {
-                Header = getHeader(hostname),
+                Header = getHeader(),
                 Payload = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(newReg))),
             };
             message.Protected = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new { nonce = getNonce(CA) }, Formatting.None)));
-            message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams(hostname)));
+            message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams()));
 
             AcmeHttpResponse regresp = postHttpResponse(CA + "/acme/new-reg", JsonConvert.SerializeObject(message, Formatting.Indented));
             if (regresp.StatusCode == HttpStatusCode.Created)
@@ -109,7 +122,7 @@ namespace MediaBrowser.ServerApplication.Networking
         {
             //get authz
             AuthzObject authzJson = null;
-            string fname = $"./ssl/domains/{hostname}/authz_{GetSha256Thumbprint(getJWK(hostname))}";
+            string fname = sslDir + $"/authz_{GetSha256Thumbprint(getJWK())}";
             //check for prev authz
             if (File.Exists(fname))
             {
@@ -143,10 +156,10 @@ namespace MediaBrowser.ServerApplication.Networking
                     }
                 };
                 var message = new JWSMessage();
-                message.Header = getHeader(hostname);
+                message.Header = getHeader();
                 message.Payload = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(newAuthz)));
                 message.Protected = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new { nonce = nextNonce }, Formatting.None)));
-                message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams(hostname)));
+                message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams()));
                 AcmeHttpResponse authzresp;
                 authzresp = postHttpResponse(CA + "/acme/new-authz", JsonConvert.SerializeObject(message, Formatting.Indented));
                 nextNonce = authzresp.Headers.Get("Replay-Nonce");
@@ -162,12 +175,12 @@ namespace MediaBrowser.ServerApplication.Networking
                     //get challenge token
 
                 }
-                
+
             }
             return authzJson;
         }
 
-        private static void completeChallenge(string hostname, AuthzObject authzJson)
+        private static void completeChallenge(AuthzObject authzJson)
         {
             //find http-01 challenge.
             Challenge http01 = null;
@@ -190,27 +203,27 @@ namespace MediaBrowser.ServerApplication.Networking
 
             //complete challenge
             //host file with contents ${token}.{GetSha256Thumbprint} at {hostname}/.well-known/acme/{token}
-            Console.WriteLine($"Outputing challenge file to {hostname}/.well-known/acme/{http01.token}");
-            File.WriteAllText(Directory.CreateDirectory($"./ssl/domains/{hostname}/.well-known/acme-challenge").FullName + "/" + http01.token, $"{http01.token}.{GetSha256Thumbprint(getJWK(hostname))}");
+            Console.WriteLine($"Outputing challenge file to {sslDir}/.well-known/acme/{http01.token}");
+            File.WriteAllText(Directory.CreateDirectory(sslDir + "/.well-known/acme-challenge").FullName + "/" + http01.token, $"{http01.token}.{GetSha256Thumbprint(getJWK())}");
 
 
             //host file on :80 now
-            string myFolder = $"./ssl/domains/{hostname}"; ///.well-known/acme-challenge";
-            SimpleHTTPServer myServer = new SimpleHTTPServer(myFolder,80);
 
+
+            SimpleHTTPServer myServer = new SimpleHTTPServer(sslDir, 80);
             //tell CA we've completed challenge
             //build challenge response payload
             var challengeResp = new
             {
                 resource = "challenge",
                 type = "http-01",
-                KeyAuthorization = $"{http01.token}.{GetSha256Thumbprint(getJWK(hostname))}", 
+                KeyAuthorization = $"{http01.token}.{GetSha256Thumbprint(getJWK())}",
             };
             var message = new JWSMessage();
-            message.Header = getHeader(hostname);
+            message.Header = getHeader();
             message.Payload = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(challengeResp)));
             message.Protected = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new { nonce = nextNonce }, Formatting.None)));
-            message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams(hostname)));
+            message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams()));
             AcmeHttpResponse challengeHttpResp;
             challengeHttpResp = postHttpResponse(http01.uri, JsonConvert.SerializeObject(message, Formatting.Indented));
             nextNonce = challengeHttpResp.Headers.Get("Replay-Nonce");
@@ -222,11 +235,11 @@ namespace MediaBrowser.ServerApplication.Networking
             {
                 Console.WriteLine(challengeHttpResp.Error.Message);
                 Console.WriteLine(challengeHttpResp.ContentAsString);
-                Quit();
+                //return?
             }
 
             //keep polling to see if challenge has been completed
-            bool challengecomplete=false;
+            bool challengecomplete = false;
             while (!challengecomplete)
             {
                 AcmeHttpResponse resp = getHttpResponse(authzJson.Uri);
@@ -243,7 +256,7 @@ namespace MediaBrowser.ServerApplication.Networking
                             break;
                         case ("pending"):
                             Console.WriteLine("waiting for CA to verify...");
-                            System.Threading.Thread.Sleep(120000);
+                            Thread.Sleep(10000);
                             break;
                         case ("invalid"):
                             Console.WriteLine("Failed challenge.");
@@ -265,10 +278,10 @@ namespace MediaBrowser.ServerApplication.Networking
                 csr = generateCSR(hostname),
             };
             var message = new JWSMessage();
-            message.Header = getHeader(hostname);
+            message.Header = getHeader();
             message.Payload = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(csr)));
             message.Protected = Base64UrlEncode(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new { nonce = nextNonce }, Formatting.None)));
-            message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams(hostname)));
+            message.Signature = Base64UrlEncode(HashAndSignBytes(Encoding.ASCII.GetBytes(message.Protected + "." + message.Payload), getKeyParams()));
             AcmeHttpResponse csrHttpResp;
             csrHttpResp = postHttpResponse(CA + "/acme/new-cert", JsonConvert.SerializeObject(message, Formatting.Indented));
             if (csrHttpResp.StatusCode == HttpStatusCode.Created)
@@ -276,10 +289,23 @@ namespace MediaBrowser.ServerApplication.Networking
                 string certUri = csrHttpResp.Headers.Get("Location");
                 if (csrHttpResp.ContentAsString != "")
                 {
-                    X509Certificate cert = new X509Certificate();
-                    cert.Import(csrHttpResp.RawContent);
-                    File.WriteAllBytes(Directory.CreateDirectory($"./ssl/domains/{hostname}/certs").FullName + "/cert.pfx", cert.Export(X509ContentType.Pfx));
-                    File.WriteAllText($"./ssl/domains/{hostname}/certs/cert.uri", certUri);
+                    StreamReader sr = new StreamReader(sslDir + "/keys/csr.key");
+                    const String pemprivheader = "-----BEGIN RSA PRIVATE KEY-----";
+                    const String pemprivfooter = "-----END RSA PRIVATE KEY-----";
+                    string pemstr = sr.ReadToEnd();
+                    sr.Close();
+                    StringBuilder sb = new StringBuilder(pemstr);
+                    sb.Replace(pemprivheader, "");  //remove headers/footers, if present
+                    sb.Replace(pemprivfooter, "");
+                    String pvkstr = sb.ToString().Trim();
+                    RSACryptoServiceProvider rsaAccount =  DecodeRSAPrivateKey(pvkstr.Base64UrlDecode());
+                    rsaAccount.PersistKeyInCsp = true;
+                    X509Certificate2 newCert = new X509Certificate2(csrHttpResp.RawContent,"",X509KeyStorageFlags.PersistKeySet)
+                    {
+                        PrivateKey = rsaAccount
+                    };
+                    File.WriteAllBytes(Directory.CreateDirectory(sslDir + "/certs").FullName + "/cert.pfx", newCert.Export(X509ContentType.Pkcs12));
+                    File.WriteAllText(sslDir + "/certs/cert.uri", certUri);
                     Console.WriteLine("SUCCESS new cert obtained!");
                     Quit();
                 }
@@ -287,19 +313,19 @@ namespace MediaBrowser.ServerApplication.Networking
             else { Console.WriteLine($"Error [{csrHttpResp.StatusCode}]: {csrHttpResp.ContentAsString}"); Quit(); }
         }
 
-        private static JWSHeader getHeader(string hostname)
+        private static JWSHeader getHeader()
         {
             JWSHeader header = new JWSHeader()
             {
                 Algorithm = "RS256",
-                Key = getJWK(hostname),
+                Key = getJWK(),
             };
             return header;
         }
 
-        private static JsonWebKey getJWK(string hostname)
+        private static JsonWebKey getJWK()
         {
-            RSAParameters keyParams = getKeyParams(hostname);
+            RSAParameters keyParams = getKeyParams();
             //generate JSON web-key headers
             JsonWebKey jwk = new JsonWebKey();
             jwk.KeyType = "RSA";
@@ -308,16 +334,16 @@ namespace MediaBrowser.ServerApplication.Networking
             return jwk;
         }
 
-        private static RSAParameters getKeyParams(string hostname)
+        private static RSAParameters getKeyParams()
         {
             //setup folder structure
-            Directory.CreateDirectory($"./ssl/domains/{hostname}/keys/");
+            Directory.CreateDirectory(sslDir + "/keys/");
             //generate keypair if needed 
             RSAParameters keyParams;
 
-            if (File.Exists($"./ssl/domains/{hostname}/keys/account.key"))
+            if (File.Exists(sslDir + "/keys/account.key"))
             {
-                StreamReader sr = new StreamReader($"./ssl/domains/{hostname}/keys/account.key");
+                StreamReader sr = new StreamReader(sslDir + "/keys/account.key");
                 const String pemprivheader = "-----BEGIN RSA PRIVATE KEY-----";
                 const String pemprivfooter = "-----END RSA PRIVATE KEY-----";
                 string pemstr = sr.ReadToEnd();
@@ -334,7 +360,7 @@ namespace MediaBrowser.ServerApplication.Networking
                 var rsaAccount = new RSACryptoServiceProvider(2048);
                 keyParams = rsaAccount.ExportParameters(true);
                 //save privkey
-                var sw = new StreamWriter($"./ssl/domains/{hostname}/keys/account.key");
+                var sw = new StreamWriter(sslDir + "/keys/account.key");
                 ExportPrivateKey(rsaAccount, sw);
                 sw.Close();
             }
@@ -402,13 +428,13 @@ namespace MediaBrowser.ServerApplication.Networking
             }
         }
 
-        private static string generateCSR(string domain)
+        private static string generateCSR(string hostname)
         {
             RSAParameters keyParams;
 
-            if (File.Exists($"./ssl/domains/{domain}/keys/csr.key"))
+            if (File.Exists(sslDir + "/keys/csr.key"))
             {
-                StreamReader sr = new StreamReader($"./ssl/domains/{domain}/keys/csr.key");
+                StreamReader sr = new StreamReader(sslDir + "/keys/csr.key");
                 const String pemprivheader = "-----BEGIN RSA PRIVATE KEY-----";
                 const String pemprivfooter = "-----END RSA PRIVATE KEY-----";
                 string pemstr = sr.ReadToEnd();
@@ -425,13 +451,13 @@ namespace MediaBrowser.ServerApplication.Networking
                 var rsaAccount = new RSACryptoServiceProvider(2048);
                 keyParams = rsaAccount.ExportParameters(true);
                 //save privkey
-                var sw = new StreamWriter($"./ssl/domains/{domain}/keys/csr.key");
+                var sw = new StreamWriter(sslDir + "/keys/csr.key");
                 ExportPrivateKey(rsaAccount, sw);
                 sw.Close();
             }
             var serializer = new Asn1Serializer();
             var sut = new CertificateRequestAsn1DEREncoder(serializer);
-            var data = new CertificateRequestData(domain, keyParams);
+            var data = new CertificateRequestData(hostname, keyParams);
             var csr = sut.EncodeAsDER(data);
             return Base64UrlEncode(csr);
         }
@@ -516,7 +542,9 @@ namespace MediaBrowser.ServerApplication.Networking
 
 
                 // ------- create RSACryptoServiceProvider instance and initialize with public key -----
-                RSACryptoServiceProvider RSA = new RSACryptoServiceProvider();
+                CspParameters Params = new CspParameters();
+                Params.KeyContainerName = "KeyContainer";
+                RSACryptoServiceProvider RSA = new RSACryptoServiceProvider(Params);
                 RSAParameters RSAparams = new RSAParameters();
                 RSAparams.Modulus = MODULUS;
                 RSAparams.Exponent = E;
@@ -757,9 +785,9 @@ namespace MediaBrowser.ServerApplication.Networking
 
         private static void Quit()
         {
-            Console.WriteLine("Press enter to quit.");
-            Console.ReadLine();
-            Environment.Exit(1);
+            //Console.WriteLine("Press enter to quit.");
+            //Console.ReadLine();
+            //Environment.Exit(1);
         }
 
         private class JsonWebKey
@@ -1070,12 +1098,21 @@ namespace MediaBrowser.ServerApplication.Networking
             {
                 _serverThread.Abort();
                 _listener.Stop();
+                //remove urlacl perms
+                var proc1 = new System.Diagnostics.ProcessStartInfo();
+                proc1.UseShellExecute = true;
+                proc1.WorkingDirectory = @"C:\Windows\System32";
+                proc1.FileName = @"C:\Windows\System32\cmd.exe";
+                proc1.Verb = "runas";
+                proc1.Arguments = "/c " + $"netsh http delete urlacl url=http://+:80/.well-known/acme-challenge/";
+                proc1.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                System.Diagnostics.Process.Start(proc1);
             }
 
             private void Listen()
             {
                 _listener = new HttpListener();
-                _listener.Prefixes.Add("http://*:" + _port.ToString() + "/");
+                _listener.Prefixes.Add("http://+:" + _port.ToString() + "/.well-known/acme-challenge/");
                 _listener.Start();
                 while (true)
                 {
@@ -1149,6 +1186,17 @@ namespace MediaBrowser.ServerApplication.Networking
 
             private void Initialize(string path, int port)
             {
+                //grant permissions for urlacl
+                var proc1 = new System.Diagnostics.ProcessStartInfo();
+                proc1.UseShellExecute = true;
+                proc1.WorkingDirectory = @"C:\Windows\System32";
+                proc1.FileName = @"C:\Windows\System32\cmd.exe";
+                proc1.Verb = "runas";
+                proc1.Arguments = "/c " + $"netsh http add urlacl url=http://+:80/.well-known/acme-challenge/ user={System.Environment.UserDomainName}\\{System.Environment.UserName}";
+                proc1.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                System.Diagnostics.Process.Start(proc1);
+                //sleep for 500ms to allow urlacl changes to propogate.
+                Thread.Sleep(500);
                 this._rootDirectory = path;
                 this._port = port;
                 _serverThread = new Thread(this.Listen);
